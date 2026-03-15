@@ -120,12 +120,12 @@ class Trainer(BaseModel):
                 self.model,
                 device_ids=[opt.local_rank],
                 output_device=opt.local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
             )
 
         self.use_amp = getattr(opt, "use_amp", True) and torch.cuda.is_available()
         self.grad_clip_norm = getattr(opt, "grad_clip_norm", 1.0)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
 
     def set_input(self, input):
@@ -164,7 +164,7 @@ class Trainer(BaseModel):
     def optimize_parameters(self):
         self.current_step += 1
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             self.forward()
             cls_loss = self.loss_fn(self.output.squeeze(1), self.label)
             contrastive_loss = self.contrastive_loss_fn(self.feature, self.label)

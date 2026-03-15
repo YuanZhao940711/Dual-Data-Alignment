@@ -252,8 +252,8 @@ if __name__ == "__main__":
     if writer is not None:
         writer.close()
 
-    if getattr(opt, "is_ddp", False):
-        dist.destroy_process_group()
-
     if is_main_process(opt):
         print("Training finished.")
+
+    if getattr(opt, "is_ddp", False):
+        dist.destroy_process_group()
