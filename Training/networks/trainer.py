@@ -1,9 +1,8 @@
-import functools
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from networks.base_model import BaseModel, init_weights
+from networks.base_model import BaseModel
 from models.dinov2_models_lora import DINOv2ModelWithLoRA
 
 from pytorch_metric_learning import losses
@@ -74,14 +73,35 @@ class Trainer(BaseModel):
         else:
             raise ValueError("optim should be [adam, sgd]")
 
+        # T_max=0 表示延迟到训练时动态设置（由 train.py 调用 set_scheduler_T_max）
+        lr_T_max = getattr(opt, "lr_T_max", 0)
+        self._lr_T_max_pending = (lr_T_max == 0)  # 标记是否需要在训练时动态设置
+        t_max_init = lr_T_max if lr_T_max > 0 else 1000  # 临时占位，后续会被覆盖
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, eta_min=opt.lr * 0.001, T_max=1000
+            self.optimizer, eta_min=opt.lr * 0.001, T_max=t_max_init
         )
-        self.loss_fn = nn.BCEWithLogitsLoss()
+
+        # ---- 不对称 BCE 损失：fp_penalty_weight 控制误报惩罚力度 ----
+        # label=1 表示 AI 生成图（fake），pos_weight 加重对 fake 的预测置信度要求。
+        # 当 pos_weight > 1 时，模型需要"更确定"才会输出1，
+        # 从而在推理时降低把真实图（label=0）误判为 fake 的概率（即降低 FPR）。
+        fp_penalty = getattr(opt, "fp_penalty_weight", 1.0)
+        if fp_penalty != 1.0:
+            pos_weight = torch.tensor([fp_penalty])
+            print(f"  [Loss] fp_penalty_weight={fp_penalty:.1f} → BCEWithLogitsLoss pos_weight={fp_penalty:.1f}")
+            print(f"  [Loss] Effect: model will be MORE conservative, reducing false positive rate (FPR)")
+        else:
+            pos_weight = None
+        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         self.contrastive_loss_fn = losses.ContrastiveLoss(
             pos_margin=0.0, neg_margin=1.0
         )
+
+        # 损失权重（可通过参数调节，默认 0.5/0.5）
+        self.loss_cls_weight = getattr(opt, "loss_cls_weight", 0.5)
+        self.loss_contrastive_weight = getattr(opt, "loss_contrastive_weight", 0.5)
+        print(f"  [Loss] cls_weight={self.loss_cls_weight}, contrastive_weight={self.loss_contrastive_weight}")
 
         if hasattr(opt, "device"):
             self.device = opt.device
@@ -90,6 +110,18 @@ class Trainer(BaseModel):
 
         self.model.to(self.device)
 
+        # pos_weight 需要在模型移到 device 之后也移过去
+        if self.loss_fn.pos_weight is not None:
+            self.loss_fn.pos_weight = self.loss_fn.pos_weight.to(self.device)
+
+        # DDP 包装：每个进程只管理自己的 GPU
+        if getattr(opt, "is_ddp", False):
+            self.model = DDP(
+                self.model,
+                device_ids=[opt.local_rank],
+                output_device=opt.local_rank,
+                find_unused_parameters=False,
+            )
 
         self.use_amp = getattr(opt, "use_amp", True) and torch.cuda.is_available()
         self.grad_clip_norm = getattr(opt, "grad_clip_norm", 1.0)
@@ -136,7 +168,7 @@ class Trainer(BaseModel):
             self.forward()
             cls_loss = self.loss_fn(self.output.squeeze(1), self.label)
             contrastive_loss = self.contrastive_loss_fn(self.feature, self.label)
-            total_loss = 0.5 * cls_loss + 0.5 * contrastive_loss
+            total_loss = self.loss_cls_weight * cls_loss + self.loss_contrastive_weight * contrastive_loss
 
         self.loss = total_loss
         self.cls_loss = cls_loss
@@ -164,6 +196,22 @@ class Trainer(BaseModel):
             "contrastive_loss": float(self.contrastive_loss.detach().item()),
         }
 
+    def set_scheduler_T_max(self, total_steps: int):
+        """在知道总训练步数后，动态设置 CosineAnnealingLR 的 T_max。
+        应在 train.py 中 create_dataloader 之后、训练循环之前调用。
+        """
+        if getattr(self, "_lr_T_max_pending", False):
+            for group in self.scheduler.base_lrs:
+                pass  # 仅做参数更新，重建 scheduler
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                eta_min=self.opt.lr * 0.001,
+                T_max=total_steps,
+                last_epoch=self.scheduler.last_epoch,
+            )
+            self._lr_T_max_pending = False
+            print(f"  [Scheduler] CosineAnnealingLR T_max set to {total_steps} steps")
+
     def train(self):
         self.model.train()
 
@@ -185,8 +233,10 @@ class Trainer(BaseModel):
             self.optimizer.zero_grad(set_to_none=True)
     
     def save_checkpoint(self, path, epoch=0, best_loss=float("inf")):
+        # DDP 模式下取 .module 获取原始模型参数
+        model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
         ckpt = {
-            "model": self.model.state_dict(),
+            "model": model_to_save.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
@@ -201,7 +251,8 @@ class Trainer(BaseModel):
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
 
-        self.model.load_state_dict(ckpt["model"], strict=False)
+        model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
+        model_to_load.load_state_dict(ckpt["model"], strict=False)
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
 

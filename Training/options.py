@@ -67,21 +67,39 @@ class BaseOptions:
         message += "----------------- End -------------------"
         print(message)
 
-        expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
-        os.makedirs(expr_dir, exist_ok=True)
-        with open(os.path.join(expr_dir, "opt.txt"), "wt") as opt_file:
+        # 修复：opt.txt 直接写入 checkpoints_dir，不再多拼接 name 子目录
+        os.makedirs(opt.checkpoints_dir, exist_ok=True)
+        with open(os.path.join(opt.checkpoints_dir, "opt.txt"), "wt") as opt_file:
             opt_file.write(message + "\n")
 
     def parse(self, print_options=True):
         opt = self.gather_options()
         opt.isTrain = self.isTrain
-        if print_options:
-            self.print_options(opt)
 
         str_ids = opt.gpu_ids.split(",")
         opt.gpu_ids = [int(x) for x in str_ids if int(x) >= 0]
-        if len(opt.gpu_ids) > 0:
-            torch.cuda.set_device(opt.gpu_ids[0])
+
+        # DDP 模式下，local_rank 由 torchrun 通过环境变量注入
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        opt.local_rank = local_rank
+        opt.is_ddp = local_rank != -1
+
+        if opt.is_ddp:
+            # DDP 模式：每个进程只使用自己对应的 GPU
+            opt.device = torch.device(f"cuda:{local_rank}")
+        else:
+            # 单卡模式
+            if opt.gpu_ids:
+                torch.cuda.set_device(opt.gpu_ids[0])
+            opt.device = (
+                torch.device(f"cuda:{opt.gpu_ids[0]}") if opt.gpu_ids
+                else torch.device("cpu")
+            )
+
+        # 只在主进程打印和保存配置
+        is_main = (not opt.is_ddp) or (local_rank == 0)
+        if print_options and is_main:
+            self.print_options(opt)
 
         self.opt = opt
         return self.opt
@@ -124,5 +142,33 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--resume", type=int, default=0)
         parser.add_argument(
             "--grad_clip_norm", type=float, default=1.0, help="Max norm for gradients"
+        )
+
+        # ===== 损失权重 =====
+        parser.add_argument(
+            "--loss_cls_weight", type=float, default=0.5,
+            help="Weight for BCE classification loss (0~1)"
+        )
+        parser.add_argument(
+            "--loss_contrastive_weight", type=float, default=0.5,
+            help="Weight for contrastive loss (0~1)"
+        )
+
+        # ===== 低误报率（Low FPR）控制 =====
+        # pos_weight > 1：加重"将真实图判为AI生成"的惩罚，迫使模型偏向保守，
+        # 使阈值天然偏高，从而降低误报率（FPR）。
+        # 建议取值范围：1.0（无偏）~ 10.0（极低误报），车损/单证场景建议 3.0~5.0
+        parser.add_argument(
+            "--fp_penalty_weight", type=float, default=1.0,
+            help="pos_weight for BCEWithLogitsLoss. >1 penalizes false positives "
+                 "(real images predicted as fake) more heavily, reducing FPR. "
+                 "Range: 1.0 (balanced) ~ 10.0 (near-zero FPR). "
+                 "Recommended for insurance domain: 3.0~5.0"
+        )
+
+        # ===== LR Scheduler =====
+        parser.add_argument(
+            "--lr_T_max", type=int, default=0,
+            help="T_max for CosineAnnealingLR. 0 = auto (set to total training steps)"
         )
         return parser
