@@ -165,7 +165,6 @@ class Trainer(BaseModel):
         self.current_step += 1
 
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-        with torch.amp.autocast('cuda', enabled=self.use_amp):
             self.forward()
             cls_loss = self.loss_fn(self.output.squeeze(1), self.label)
             contrastive_loss = self.contrastive_loss_fn(self.feature, self.label)

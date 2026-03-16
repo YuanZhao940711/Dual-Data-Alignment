@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export TOKENIZERS_PARALLELISM=false
+
 # ========= User Configuration =========
 # TODO: Update these paths for your environment
 REAL_PATH="/root/autodl-tmp/AIGC_Detection/车损AIGC检测图片/重建汽车图片/real"
