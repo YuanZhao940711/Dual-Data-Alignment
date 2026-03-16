@@ -68,7 +68,7 @@ class BaseOptions:
         print(message)
 
         # 修复：opt.txt 直接写入 checkpoints_dir，不再多拼接 name 子目录
-        os.makedirs(opt.checkpoints_dir, exist_ok=True)
+        # os.makedirs(opt.checkpoints_dir, exist_ok=True)
         with open(os.path.join(opt.checkpoints_dir, "opt.txt"), "wt") as opt_file:
             opt_file.write(message + "\n")
 
